@@ -6,7 +6,11 @@ import traceback
 import inspect
 from pathlib import Path
 
-LOG_FILE = Path("wv_traces.jsonl")
+RUNS_DIR = Path("runs")
+
+# One file per process — set at import time
+_run_id = time.strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+LOG_FILE = RUNS_DIR / f"{_run_id}.jsonl"
 
 
 def _serialize(obj):

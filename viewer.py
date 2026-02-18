@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request
 
-TRACE_FILE = Path("wv_traces.jsonl")
+RUNS_DIR = Path("runs")
 
 app = Flask(__name__)
 
@@ -250,6 +250,8 @@ button:hover { background: #30363d; }
 
 <div id="header">
     <h2>WV Trace Viewer</h2>
+    <label style="font-size:13px;color:#8b949e">Run:</label>
+    <select id="runPicker"></select>
     <label style="font-size:13px;color:#8b949e">File:</label>
     <select id="filePicker"></select>
     <button onclick="refresh()">Refresh</button>
@@ -294,6 +296,7 @@ let filteredTraces = []     // current trace list (may be filtered)
 let activeFilter = null     // fn name filter from code click
 let fnLineMap = {}          // fnName -> {decorator_line, start_line, end_line}
 let currentFile = null
+let currentRun = null
 
 let playStep = -1           // current playback index into allTraces
 let playTimer = null        // setTimeout handle
@@ -307,16 +310,60 @@ const SPEED_VALUES = [0.25, 0.5, 1, 2, 4]
 // Init
 // ─────────────────────────────────────────────
 async function init() {
-    await loadFiles()
+    await loadRuns()
     await loadTracesAndSource()
 }
 
 async function refresh() {
+    await loadRuns(true)
     await loadTracesAndSource()
 }
 
+async function loadRuns(keepCurrent = false) {
+    const res = await fetch("/runs")
+    const runs = await res.json()
+
+    const picker = document.getElementById("runPicker")
+    const prev = currentRun
+
+    picker.innerHTML = ""
+
+    if (runs.length === 0) {
+        const opt = document.createElement("option")
+        opt.value = ""
+        opt.textContent = "(no runs)"
+        picker.appendChild(opt)
+        currentRun = null
+        return
+    }
+
+    runs.forEach(r => {
+        const opt = document.createElement("option")
+        opt.value = r.id
+        opt.textContent = r.label
+        picker.appendChild(opt)
+    })
+
+    if (keepCurrent && prev && runs.find(r => r.id === prev)) {
+        picker.value = prev
+        currentRun = prev
+    } else {
+        currentRun = runs[0].id
+        picker.value = currentRun
+    }
+
+    picker.onchange = async () => {
+        currentRun = picker.value
+        activeFilter = null
+        playStep = -1
+        pausePlay()
+        await loadFiles()
+        await loadTracesAndSource()
+    }
+}
+
 async function loadFiles() {
-    const res = await fetch("/files")
+    const res = await fetch("/files?run=" + encodeURIComponent(currentRun || ""))
     const files = await res.json()
 
     const picker = document.getElementById("filePicker")
@@ -327,6 +374,7 @@ async function loadFiles() {
         opt.value = ""
         opt.textContent = "(no source files)"
         picker.appendChild(opt)
+        currentFile = null
         return
     }
 
@@ -348,6 +396,7 @@ async function loadFiles() {
 }
 
 async function loadTracesAndSource() {
+    await loadFiles()
     await Promise.all([loadTraces(), loadSource()])
     buildFnLineMap()
     applyFnLineMarkers()
@@ -357,7 +406,7 @@ async function loadTracesAndSource() {
 // Traces
 // ─────────────────────────────────────────────
 async function loadTraces() {
-    const res = await fetch("/traces")
+    const res = await fetch("/traces?run=" + encodeURIComponent(currentRun || ""))
     const data = await res.json()
     allTraces = data.traces
     applyFilter()
@@ -425,7 +474,7 @@ async function loadSource() {
         return
     }
 
-    const res = await fetch("/source?file=" + encodeURIComponent(currentFile))
+    const res = await fetch("/source?run=" + encodeURIComponent(currentRun || "") + "&file=" + encodeURIComponent(currentFile))
     if (!res.ok) {
         panel.innerHTML = '<div class="empty-msg">Could not load source.</div>'
         return
@@ -709,13 +758,25 @@ init()
 """
 
 
-def load_traces():
+def get_run_file(run_id):
+    if not run_id:
+        return None
+    path = RUNS_DIR / f"{run_id}.jsonl"
+    # Safety: must resolve inside RUNS_DIR
+    try:
+        path.resolve().relative_to(RUNS_DIR.resolve())
+    except ValueError:
+        return None
+    return path
+
+
+def load_traces_from(run_id):
+    path = get_run_file(run_id)
+    if not path or not path.exists():
+        return []
+
     traces = []
-
-    if not TRACE_FILE.exists():
-        return traces
-
-    with TRACE_FILE.open() as f:
+    with path.open(encoding="utf-8") as f:
         for line in f:
             try:
                 traces.append(json.loads(line))
@@ -731,15 +792,39 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/runs")
+def runs():
+    if not RUNS_DIR.exists():
+        return jsonify([])
+
+    files = sorted(RUNS_DIR.glob("*.jsonl"), reverse=True)
+    result = []
+    for f in files:
+        run_id = f.stem
+        # Parse timestamp from filename for a nice label
+        parts = run_id.split("_")
+        if len(parts) >= 2:
+            date = parts[0]       # 20250218
+            time_part = parts[1]  # 143022
+            label = f"{date[:4]}-{date[4:6]}-{date[6:]} {time_part[:2]}:{time_part[2:4]}:{time_part[4:]}"
+        else:
+            label = run_id
+        result.append({"id": run_id, "label": label})
+
+    return jsonify(result)
+
+
 @app.route("/traces")
 def traces():
-    all_traces = load_traces()
+    run_id = request.args.get("run", "")
+    all_traces = load_traces_from(run_id)
     return jsonify({"traces": all_traces})
 
 
 @app.route("/files")
 def files():
-    all_traces = load_traces()
+    run_id = request.args.get("run", "")
+    all_traces = load_traces_from(run_id)
 
     seen = {}
     for t in all_traces:
@@ -752,10 +837,11 @@ def files():
 
 @app.route("/source")
 def source():
+    run_id = request.args.get("run", "")
     requested = request.args.get("file", "")
 
-    # Security whitelist: only serve files referenced in traces
-    all_traces = load_traces()
+    # Security whitelist: only serve files referenced in this run's traces
+    all_traces = load_traces_from(run_id)
     allowed = {t.get("source_file") for t in all_traces if t.get("source_file")}
 
     if requested not in allowed:
