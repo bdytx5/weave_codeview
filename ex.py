@@ -1,13 +1,20 @@
+import sys
 import os
-from openai import OpenAI
-from cdwv import wv
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'real_weave/weave'))
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+import weave
+from weave.trace_server_bindings.jsonl_logging_trace_server import attach_jsonl_logger
+
+client = weave.init("cd-weave-demo")
+log_path = attach_jsonl_logger(client)
+print(f"Logging to: {log_path}\n")
 
 
-@wv.op
-def ask(prompt, system="You are a helpful assistant."):
-    response = client.responses.create(
+@weave.op
+def ask(prompt: str, system: str = "You are a helpful assistant.") -> str:
+    from openai import OpenAI
+    c = OpenAI()
+    response = c.responses.create(
         model="gpt-4.1",
         instructions=system,
         input=prompt,
@@ -15,9 +22,11 @@ def ask(prompt, system="You are a helpful assistant."):
     return response.output_text
 
 
-@wv.op
-def summarize(text):
-    response = client.responses.create(
+@weave.op
+def summarize(text: str) -> str:
+    from openai import OpenAI
+    c = OpenAI()
+    response = c.responses.create(
         model="gpt-4.1",
         instructions="Summarize the following text in one sentence.",
         input=text,
@@ -25,9 +34,11 @@ def summarize(text):
     return response.output_text
 
 
-@wv.op
-def translate(text, language):
-    response = client.responses.create(
+@weave.op
+def translate(text: str, language: str) -> str:
+    from openai import OpenAI
+    c = OpenAI()
+    response = c.responses.create(
         model="gpt-4.1",
         instructions=f"Translate the following text to {language}. Reply with only the translation.",
         input=text,
@@ -35,9 +46,11 @@ def translate(text, language):
     return response.output_text
 
 
-@wv.op
-def classify_sentiment(text):
-    response = client.responses.create(
+@weave.op
+def classify_sentiment(text: str) -> str:
+    from openai import OpenAI
+    c = OpenAI()
+    response = c.responses.create(
         model="gpt-4.1",
         instructions="Classify the sentiment of the text as positive, negative, or neutral. Reply with one word only.",
         input=text,
@@ -45,18 +58,17 @@ def classify_sentiment(text):
     return response.output_text
 
 
-@wv.op
-def broken_call(prompt):
-    # This will raise — bad model name — so we get an error trace
-    response = client.responses.create(
+@weave.op
+def broken_call(prompt: str) -> str:
+    from openai import OpenAI
+    c = OpenAI()
+    response = c.responses.create(
         model="gpt-999-fake",
         instructions="You are helpful.",
         input=prompt,
     )
     return response.output_text
 
-
-# --- run a bunch of calls ---
 
 answer = ask("What is the capital of France?")
 print("ask:", answer)
@@ -86,3 +98,6 @@ try:
     broken_call("This will fail")
 except Exception as e:
     print("broken_call error (expected):", type(e).__name__)
+
+weave.finish()
+print(f"\nDone. Run file: {log_path}")

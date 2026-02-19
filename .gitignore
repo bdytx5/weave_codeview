@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+example_multi/
+vscode-extension/node_modules/
+real_weave/weave/

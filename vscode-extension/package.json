@@ -1,0 +1,69 @@
+{
+  "name": "cdweave-viewer",
+  "displayName": "CDWeave Trace Viewer",
+  "description": "View WV trace runs inside VSCode",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cdweave-sidebar",
+          "title": "CDWeave Traces",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "cdweave-sidebar": [
+        {
+          "id": "cdweaveTraceTree",
+          "name": "Trace Runs"
+        },
+        {
+          "id": "cdweaveAllTraces",
+          "name": "Selected Traces"
+        },
+        {
+          "id": "cdweaveTraceDetail",
+          "name": "Trace Detail"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cdweave.selectTrace",
+        "title": "Select CDWeave Trace"
+      },
+      {
+        "command": "cdweave.openTraceUrl",
+        "title": "🍩 Open in Weave",
+        "icon": "$(link-external)"
+      }
+    ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "cdweave.openTraceUrl",
+          "when": "view =~ /cdweaveTraceTree|cdweaveAllTraces/ && viewItem == traceCallWithUrl",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

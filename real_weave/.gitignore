@@ -1,0 +1,13 @@
+weave/__pycache__/
+weave/**/__pycache__/
+weave/**/*.pyc
+weave/.pytest_cache/
+weave/**/.pytest_cache/
+weave/.mypy_cache/
+weave/.ruff_cache/
+weave/node_modules/
+weave/*.egg-info/
+weave/dist/
+weave/build/
+weave/.venv/
+weave/runs/
