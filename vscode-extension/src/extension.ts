@@ -33,6 +33,8 @@ interface TraceStore {
     focusedFn: string | null;
     suppressCursorFilter: boolean;
     highlightActive: boolean;
+    snapshotRepoRoot: string | null;  // set when viewing old snapshot code
+    snapshotDidStash: boolean;        // whether we auto-stashed before entering snapshot mode
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +97,50 @@ function traceUrl(trace: TraceRecord): string | null {
     return trace.wandb_url ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Environment checks
+// ---------------------------------------------------------------------------
+
+function runEnvironmentChecks(): void {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) { return; }
+    const wsRoot = folders[0].uri.fsPath;
+
+    // 1. Git repo check
+    const isGitRepo = fs.existsSync(path.join(wsRoot, '.git'));
+    if (!isGitRepo) {
+        vscode.window.showWarningMessage(
+            'CodeWeave: No git repo found in workspace. Code restore features will not work.',
+            'Copy init command'
+        ).then(choice => {
+            if (choice === 'Copy init command') {
+                vscode.env.clipboard.writeText('git init && git add . && git commit -m "init"');
+                vscode.window.showInformationMessage('Copied: git init && git add . && git commit -m "init"');
+            }
+        });
+    }
+
+    // 2. Weave package check — must have jsonl_logging_trace_server
+    try {
+        const python = execSync('which python || which python3', { encoding: 'utf8' }).trim().split('\n')[0];
+        const result = execSync(
+            `${python} -c "from weave.trace_server_bindings.jsonl_logging_trace_server import attach_jsonl_logger; print('ok')"`,
+            { encoding: 'utf8', cwd: wsRoot }
+        ).trim();
+        if (result !== 'ok') { throw new Error('import failed'); }
+    } catch {
+        vscode.window.showWarningMessage(
+            'CodeWeave: Custom weave package not found. Install it to enable trace logging.',
+            'Copy install command'
+        ).then(choice => {
+            if (choice === 'Copy install command') {
+                vscode.env.clipboard.writeText('pip install git+https://github.com/bdytx5/codeweave_package.git');
+                vscode.window.showInformationMessage('Copied: pip install git+https://github.com/bdytx5/codeweave_package.git');
+            }
+        });
+    }
+}
+
 function getRunsDir(): string | null {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) { return null; }
@@ -143,6 +189,22 @@ function getRunGitState(runId: string): RunGitState | null {
 
 function runGit(args: string[], cwd: string): string {
     return execSync(['git', ...args].join(' '), { cwd, encoding: 'utf8' }).trim();
+}
+
+function getCurrentHeadSha(repoRoot: string): string | null {
+    try {
+        return runGit(['rev-parse', '--short', 'HEAD'], repoRoot);
+    } catch {
+        return null;
+    }
+}
+
+function hasUncommittedChanges(repoRoot: string): boolean {
+    try {
+        return runGit(['status', '--porcelain'], repoRoot).length > 0;
+    } catch {
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +314,29 @@ class TraceTreeProvider implements vscode.TreeDataProvider<TraceRunItem | TraceC
                 this.store.runTraces.set(runId, traces);
             }
             const traces = this.store.runTraces.get(runId) ?? [];
+
+            // Warn if run's code state differs from current HEAD
+            const gs = element.gitState;
+            if (gs?.git_repo_root) {
+                const currentHead = getCurrentHeadSha(gs.git_repo_root);
+                const runCommit = gs.git_dirty ? gs.git_snapshot_sha?.slice(0, 8) : gs.git_commit;
+                const isStale = gs.git_dirty
+                    ? gs.git_snapshot_sha !== null  // always stale if it was dirty at run time
+                    : currentHead !== null && gs.git_commit !== null && !currentHead.startsWith(gs.git_commit) && !gs.git_commit.startsWith(currentHead);
+                if (isStale) {
+                    const label = parseRunLabel(runId);
+                    const runDesc = gs.git_dirty ? `snapshot ${gs.git_snapshot_sha?.slice(0, 8)}` : `commit ${gs.git_commit}`;
+                    vscode.window.showWarningMessage(
+                        `CDWeave: Run "${label}" was recorded at a different code version (${runDesc}, current HEAD: ${currentHead ?? 'unknown'}).`,
+                        'Switch to this code'
+                    ).then(choice => {
+                        if (choice === 'Switch to this code') {
+                            vscode.commands.executeCommand('cdweave.restoreRunCode', element);
+                        }
+                    });
+                }
+            }
+
             return traces.map(t => new TraceCallItem(t, runId));
         }
 
@@ -566,6 +651,8 @@ export function activate(context: vscode.ExtensionContext) {
         focusedFn: null,
         suppressCursorFilter: false,
         highlightActive: true,
+        snapshotRepoRoot: null,
+        snapshotDidStash: false,
     };
 
     const provider = new TraceTreeProvider(store);
@@ -573,6 +660,39 @@ export function activate(context: vscode.ExtensionContext) {
     const detailProvider = new TraceDetailProvider();
     const decorationManager = new DecorationManager(store, context);
     const hoverProvider = new TraceHoverProvider(store);
+
+    // Status bar button shown while viewing snapshot code
+    const snapshotStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    snapshotStatusBar.text = '$(history) Viewing old code — click to restore current';
+    snapshotStatusBar.tooltip = 'You are viewing a snapshot of the code from a past run. Click to restore HEAD.';
+    snapshotStatusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    snapshotStatusBar.command = 'cdweave.restoreMainCode';
+    context.subscriptions.push(snapshotStatusBar);
+
+    function enterSnapshotMode(repoRoot: string, didStash: boolean): void {
+        store.snapshotRepoRoot = repoRoot;
+        store.snapshotDidStash = didStash;
+        snapshotStatusBar.show();
+        const config = vscode.workspace.getConfiguration('files');
+        config.update('readonlyInclude', { '**/*': true }, vscode.ConfigurationTarget.Workspace);
+    }
+
+    function exitSnapshotMode(): void {
+        const repoRoot = store.snapshotRepoRoot;
+        const didStash = store.snapshotDidStash;
+        store.snapshotRepoRoot = null;
+        store.snapshotDidStash = false;
+        snapshotStatusBar.hide();
+        const config = vscode.workspace.getConfiguration('files');
+        config.update('readonlyInclude', undefined, vscode.ConfigurationTarget.Workspace);
+        if (didStash && repoRoot) {
+            try {
+                runGit(['stash', 'pop'], repoRoot);
+            } catch {
+                vscode.window.showWarningMessage('CDWeave: Could not auto-pop stash. Run "git stash pop" manually.');
+            }
+        }
+    }
 
     const treeView = vscode.window.createTreeView('cdweaveTraceTree', {
         treeDataProvider: provider,
@@ -624,41 +744,41 @@ export function activate(context: vscode.ExtensionContext) {
             }
             const shortSha = gs.git_snapshot_sha.slice(0, 8);
             const choice = await vscode.window.showWarningMessage(
-                `Restore code from run "${parseRunLabel(item.runId)}"?\n\nThis will overwrite your working tree with snapshot ${shortSha}. Uncommitted changes will be lost.`,
+                `View code from run "${parseRunLabel(item.runId)}" (snapshot ${shortSha})?\n\nYour current changes will be stashed and restored when you click "Back to current code".`,
                 { modal: true },
-                'Restore'
+                'View snapshot'
             );
-            if (choice !== 'Restore') { return; }
+            if (choice !== 'View snapshot') { return; }
             try {
+                const dirty = hasUncommittedChanges(gs.git_repo_root);
+                if (dirty) {
+                    runGit(['stash', 'push', '-u', '-m', `cdweave: before snapshot ${shortSha}`], gs.git_repo_root);
+                }
                 runGit(['checkout', gs.git_snapshot_sha, '--', '.'], gs.git_repo_root);
-                vscode.window.showInformationMessage(`CDWeave: Working tree restored to snapshot ${shortSha}.`);
+                enterSnapshotMode(gs.git_repo_root, dirty);
             } catch (e: unknown) {
                 const err = e as { message?: string };
-                vscode.window.showErrorMessage(`CDWeave: git checkout failed — ${err.message ?? String(e)}`);
+                vscode.window.showErrorMessage(`CDWeave: Restore failed — ${err.message ?? String(e)}`);
             }
         }
     );
 
     const restoreMainCodeCmd = vscode.commands.registerCommand(
         'cdweave.restoreMainCode',
-        async (item: TraceRunItem) => {
-            const gs = item.gitState;
-            if (!gs?.git_repo_root) {
-                vscode.window.showWarningMessage('CDWeave: No git repo info for this run.');
+        async (item?: TraceRunItem) => {
+            // Can be called from status bar (no item) or tree context menu (item provided)
+            const repoRoot = store.snapshotRepoRoot ?? item?.gitState?.git_repo_root ?? null;
+            if (!repoRoot) {
+                vscode.window.showWarningMessage('CDWeave: Not currently viewing a snapshot.');
                 return;
             }
-            const choice = await vscode.window.showWarningMessage(
-                `Reset working tree back to HEAD?\n\nThis will discard any uncommitted changes in ${gs.git_repo_root}.`,
-                { modal: true },
-                'Reset to HEAD'
-            );
-            if (choice !== 'Reset to HEAD') { return; }
             try {
-                runGit(['checkout', 'HEAD', '--', '.'], gs.git_repo_root);
-                vscode.window.showInformationMessage('CDWeave: Working tree reset to HEAD.');
+                runGit(['checkout', 'HEAD', '--', '.'], repoRoot);
+                exitSnapshotMode();
+                vscode.window.showInformationMessage('CDWeave: Restored to current code (HEAD).');
             } catch (e: unknown) {
                 const err = e as { message?: string };
-                vscode.window.showErrorMessage(`CDWeave: git checkout failed — ${err.message ?? String(e)}`);
+                vscode.window.showErrorMessage(`CDWeave: Restore failed — ${err.message ?? String(e)}`);
             }
         }
     );
@@ -771,6 +891,8 @@ export function activate(context: vscode.ExtensionContext) {
     if (store.activeRunId) {
         decorationManager.applyToAllVisibleEditors();
     }
+
+    runEnvironmentChecks();
 
     context.subscriptions.push(
         treeView,
