@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'child_process';
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -8,9 +9,9 @@ import * as path from 'path';
 
 interface TraceRecord {
     call_id: string;
-    function: string;          // normalised — derived from op_name if not present
+    function: string;
     op_name: string | null;
-    wandb_url: string | null;  // pre-built by logger
+    wandb_url: string | null;
     source_file: string | null;
     source_line_start: number | null;
     source_line_end: number | null;
@@ -19,6 +20,10 @@ interface TraceRecord {
     inputs: Record<string, unknown>;
     output: unknown;
     error: { type: string; message: string; traceback: string } | string | null;
+    git_repo_root: string | null;
+    git_commit: string | null;
+    git_dirty: boolean;
+    git_snapshot_sha: string | null;
 }
 
 interface TraceStore {
@@ -26,7 +31,8 @@ interface TraceStore {
     runTraces: Map<string, TraceRecord[]>;
     selectedCallId: string | null;
     focusedFn: string | null;
-    suppressCursorFilter: boolean;  // true after selectTrace fires; suppresses next cursor-based filter
+    suppressCursorFilter: boolean;
+    highlightActive: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,10 +52,8 @@ function parseRunLabel(stem: string): string {
 }
 
 function normaliseTrace(raw: Record<string, unknown>): TraceRecord {
-    // Support both cdwv format (has 'function') and real weave format (has 'op_name')
     let fnName = (raw['function'] as string) ?? null;
     if (!fnName && raw['op_name']) {
-        // "weave:///project/op/my_func:abc123"  →  "my_func"
         const opName = raw['op_name'] as string;
         fnName = opName.split('/').pop()?.split(':')[0] ?? opName;
     }
@@ -66,6 +70,10 @@ function normaliseTrace(raw: Record<string, unknown>): TraceRecord {
         inputs: (raw['inputs'] as Record<string, unknown>) ?? {},
         output: raw['output'] ?? null,
         error: (raw['error'] as TraceRecord['error']) ?? null,
+        git_repo_root: (raw['git_repo_root'] as string) ?? null,
+        git_commit: (raw['git_commit'] as string) ?? null,
+        git_dirty: (raw['git_dirty'] as boolean) ?? false,
+        git_snapshot_sha: (raw['git_snapshot_sha'] as string) ?? null,
     };
 }
 
@@ -90,7 +98,51 @@ function traceUrl(trace: TraceRecord): string | null {
 function getRunsDir(): string | null {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) { return null; }
+    // Find the first workspace folder that actually has a runs/ directory
+    for (const folder of folders) {
+        const candidate = path.join(folder.uri.fsPath, 'runs');
+        if (fs.existsSync(candidate)) { return candidate; }
+    }
+    // Fall back to first folder (runs/ doesn't exist yet)
     return path.join(folders[0].uri.fsPath, 'runs');
+}
+
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
+interface RunGitState {
+    git_repo_root: string | null;
+    git_commit: string | null;
+    git_dirty: boolean;
+    git_snapshot_sha: string | null;
+}
+
+function getRunGitState(runId: string): RunGitState | null {
+    const runsDir = getRunsDir();
+    if (!runsDir) { return null; }
+    const filePath = path.join(runsDir, `${runId}.jsonl`);
+    if (!fs.existsSync(filePath)) { return null; }
+    let content: string;
+    try { content = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+    for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) { continue; }
+        try {
+            const raw = JSON.parse(trimmed);
+            return {
+                git_repo_root: (raw['git_repo_root'] as string) ?? null,
+                git_commit: (raw['git_commit'] as string) ?? null,
+                git_dirty: (raw['git_dirty'] as boolean) ?? false,
+                git_snapshot_sha: (raw['git_snapshot_sha'] as string) ?? null,
+            };
+        } catch { continue; }
+    }
+    return null;
+}
+
+function runGit(args: string[], cwd: string): string {
+    return execSync(['git', ...args].join(' '), { cwd, encoding: 'utf8' }).trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +150,18 @@ function getRunsDir(): string | null {
 // ---------------------------------------------------------------------------
 
 class TraceRunItem extends vscode.TreeItem {
+    public readonly gitState: RunGitState | null;
+
     constructor(public readonly runId: string) {
         super(parseRunLabel(runId), vscode.TreeItemCollapsibleState.Collapsed);
+        this.gitState = getRunGitState(runId);
+        const gs = this.gitState;
+        if (gs?.git_commit) {
+            const dirtyMark = gs.git_dirty ? '*' : '';
+            this.description = `${gs.git_commit}${dirtyMark}${gs.git_snapshot_sha ? '  📸' : ''}`;
+        }
         this.iconPath = new vscode.ThemeIcon('history');
-        this.contextValue = 'traceRun';
+        this.contextValue = gs?.git_snapshot_sha ? 'traceRunWithSnapshot' : 'traceRun';
     }
 }
 
@@ -171,7 +231,6 @@ class TraceTreeProvider implements vscode.TreeDataProvider<TraceRunItem | TraceC
 
     getChildren(element?: TraceRunItem | TraceCallItem): vscode.ProviderResult<(TraceRunItem | TraceCallItem)[]> {
         if (!element) {
-            // Root: list runs
             const runsDir = getRunsDir();
             if (!runsDir) { return []; }
             let files: string[] = [];
@@ -237,23 +296,17 @@ class TraceDetailProvider implements vscode.TreeDataProvider<DetailItem> {
         }
 
         const items: DetailItem[] = [];
-
-        // duration
         items.push(new DetailItem('duration', `${trace.duration_s.toFixed(3)}s`));
 
-        // timestamp
         const ts = new Date(trace.timestamp_start * 1000);
-        const timeStr = ts.toLocaleTimeString();
-        items.push(new DetailItem('called at', timeStr));
+        items.push(new DetailItem('called at', ts.toLocaleTimeString()));
 
-        // inputs
         const inputEntries = Object.entries(trace.inputs);
         if (inputEntries.length === 0) {
             items.push(new DetailItem('inputs', '(none)'));
         } else {
             const inputChildren = inputEntries.map(([k, v]) => {
                 const valStr = JSON.stringify(v);
-                // If the value is an object/array, make it expandable
                 if (typeof v === 'object' && v !== null) {
                     const nested = this._buildObjectNodes(v as Record<string, unknown>);
                     return new DetailItem(
@@ -264,14 +317,9 @@ class TraceDetailProvider implements vscode.TreeDataProvider<DetailItem> {
                 }
                 return new DetailItem(k, valStr);
             });
-            items.push(new DetailItem(
-                'inputs', undefined,
-                vscode.TreeItemCollapsibleState.Expanded,
-                inputChildren
-            ));
+            items.push(new DetailItem('inputs', undefined, vscode.TreeItemCollapsibleState.Expanded, inputChildren));
         }
 
-        // output or error
         if (trace.error) {
             const errChildren = [
                 new DetailItem('type', trace.error.type),
@@ -381,8 +429,8 @@ class DecorationManager {
     }
 
     applyToEditor(editor: vscode.TextEditor): void {
-        const { activeRunId, runTraces, focusedFn, selectedCallId } = this.store;
-        if (!activeRunId) {
+        const { activeRunId, runTraces, focusedFn, selectedCallId, highlightActive } = this.store;
+        if (!activeRunId || !highlightActive) {
             editor.setDecorations(this._highlight, []);
             editor.setDecorations(this._gutter, []);
             return;
@@ -391,7 +439,6 @@ class DecorationManager {
         const allTraces = runTraces.get(activeRunId) ?? [];
         const filePath = editor.document.uri.fsPath;
 
-        // Only traces with source info can decorate
         const fileTraces = allTraces.filter(t => t.source_file === filePath && t.source_line_start !== null);
         const gutterSeen = new Set<string>();
         const gutterRanges: vscode.Range[] = [];
@@ -403,15 +450,12 @@ class DecorationManager {
             }
         }
 
-        // Highlight: filtered by focusedFn if set
         let highlightTraces = fileTraces;
         if (focusedFn) {
             highlightTraces = highlightTraces.filter(t => t.function === focusedFn);
         } else if (selectedCallId) {
             const selected = highlightTraces.filter(t => t.call_id === selectedCallId);
-            if (selected.length > 0) {
-                highlightTraces = selected;
-            }
+            if (selected.length > 0) { highlightTraces = selected; }
         }
 
         const highlightRanges: vscode.Range[] = highlightTraces.map(t => {
@@ -458,7 +502,7 @@ class TraceHoverProvider implements vscode.HoverProvider {
 
         const allTraces = this.store.runTraces.get(this.store.activeRunId) ?? [];
         const filePath = document.uri.fsPath;
-        const cursorLine = position.line; // 0-indexed
+        const cursorLine = position.line;
 
         const matches = allTraces.filter(t =>
             t.source_file === filePath &&
@@ -481,7 +525,7 @@ class TraceHoverProvider implements vscode.HoverProvider {
             md.appendMarkdown(`**Call ${i + 1}** — ${timeStr}  \n`);
 
             const inputsJson = JSON.stringify(t.inputs, null, 2);
-            const cappedInputs = inputsJson.length > 1000 ? inputsJson.slice(0, 1000) + '…' : inputsJson;
+            const cappedInputs = inputsJson.length > 1000 ? inputsJson.slice(0, 1000) + '...' : inputsJson;
             md.appendMarkdown(`**Inputs:**\n\`\`\`json\n${cappedInputs}\n\`\`\`\n`);
 
             if (t.error) {
@@ -489,12 +533,12 @@ class TraceHoverProvider implements vscode.HoverProvider {
                 md.appendMarkdown(`**Error:** ${errStr}\n\n`);
             } else {
                 const outputStr = JSON.stringify(t.output, null, 2);
-                const cappedOutput = outputStr.length > 1000 ? outputStr.slice(0, 1000) + '…' : outputStr;
+                const cappedOutput = outputStr.length > 1000 ? outputStr.slice(0, 1000) + '...' : outputStr;
                 md.appendMarkdown(`**Output:**\n\`\`\`\n${cappedOutput}\n\`\`\`\n`);
             }
 
             if (t.wandb_url) {
-                md.appendMarkdown(`[🍩 View in W&B](${t.wandb_url})\n\n`);
+                md.appendMarkdown(`[View in W&B](${t.wandb_url})\n\n`);
             }
 
             if (i < matches.length - 1) { md.appendMarkdown('\n---\n\n'); }
@@ -521,6 +565,7 @@ export function activate(context: vscode.ExtensionContext) {
         selectedCallId: null,
         focusedFn: null,
         suppressCursorFilter: false,
+        highlightActive: true,
     };
 
     const provider = new TraceTreeProvider(store);
@@ -529,7 +574,6 @@ export function activate(context: vscode.ExtensionContext) {
     const decorationManager = new DecorationManager(store, context);
     const hoverProvider = new TraceHoverProvider(store);
 
-    // Register tree views
     const treeView = vscode.window.createTreeView('cdweaveTraceTree', {
         treeDataProvider: provider,
         showCollapseAll: true,
@@ -541,13 +585,23 @@ export function activate(context: vscode.ExtensionContext) {
         treeDataProvider: detailProvider,
     });
 
-    // Register hover provider for Python files
     const hoverDisposable = vscode.languages.registerHoverProvider(
         { language: 'python' },
         hoverProvider
     );
 
-    // Register openTraceUrl command — opens W&B trace page in browser
+    const clearFocusCmd = vscode.commands.registerCommand(
+        'cdweave.clearFocus',
+        () => {
+            store.highlightActive = false;
+            store.focusedFn = null;
+            store.selectedCallId = null;
+            provider.setFunctionFilter(null);
+            allTracesProvider.refresh();
+            decorationManager.clearAll();
+        }
+    );
+
     const openTraceUrlCmd = vscode.commands.registerCommand(
         'cdweave.openTraceUrl',
         (item: TraceCallItem) => {
@@ -555,12 +609,60 @@ export function activate(context: vscode.ExtensionContext) {
             if (url) {
                 vscode.env.openExternal(vscode.Uri.parse(url));
             } else {
-                vscode.window.showInformationMessage('CDWeave: No W&B URL available for this trace (missing op_name).');
+                vscode.window.showInformationMessage('CDWeave: No W&B URL available for this trace.');
             }
         }
     );
 
-    // Register selectTrace command
+    const restoreRunCodeCmd = vscode.commands.registerCommand(
+        'cdweave.restoreRunCode',
+        async (item: TraceRunItem) => {
+            const gs = item.gitState;
+            if (!gs?.git_snapshot_sha || !gs.git_repo_root) {
+                vscode.window.showWarningMessage('CDWeave: No snapshot found for this run.');
+                return;
+            }
+            const shortSha = gs.git_snapshot_sha.slice(0, 8);
+            const choice = await vscode.window.showWarningMessage(
+                `Restore code from run "${parseRunLabel(item.runId)}"?\n\nThis will overwrite your working tree with snapshot ${shortSha}. Uncommitted changes will be lost.`,
+                { modal: true },
+                'Restore'
+            );
+            if (choice !== 'Restore') { return; }
+            try {
+                runGit(['checkout', gs.git_snapshot_sha, '--', '.'], gs.git_repo_root);
+                vscode.window.showInformationMessage(`CDWeave: Working tree restored to snapshot ${shortSha}.`);
+            } catch (e: unknown) {
+                const err = e as { message?: string };
+                vscode.window.showErrorMessage(`CDWeave: git checkout failed — ${err.message ?? String(e)}`);
+            }
+        }
+    );
+
+    const restoreMainCodeCmd = vscode.commands.registerCommand(
+        'cdweave.restoreMainCode',
+        async (item: TraceRunItem) => {
+            const gs = item.gitState;
+            if (!gs?.git_repo_root) {
+                vscode.window.showWarningMessage('CDWeave: No git repo info for this run.');
+                return;
+            }
+            const choice = await vscode.window.showWarningMessage(
+                `Reset working tree back to HEAD?\n\nThis will discard any uncommitted changes in ${gs.git_repo_root}.`,
+                { modal: true },
+                'Reset to HEAD'
+            );
+            if (choice !== 'Reset to HEAD') { return; }
+            try {
+                runGit(['checkout', 'HEAD', '--', '.'], gs.git_repo_root);
+                vscode.window.showInformationMessage('CDWeave: Working tree reset to HEAD.');
+            } catch (e: unknown) {
+                const err = e as { message?: string };
+                vscode.window.showErrorMessage(`CDWeave: git checkout failed — ${err.message ?? String(e)}`);
+            }
+        }
+    );
+
     const selectTraceCmd = vscode.commands.registerCommand(
         'cdweave.selectTrace',
         async (item: TraceCallItem) => {
@@ -568,22 +670,20 @@ export function activate(context: vscode.ExtensionContext) {
             store.selectedCallId = item.trace.call_id;
             store.focusedFn = item.trace.function;
             store.suppressCursorFilter = true;
+            store.highlightActive = true;
 
             const runsDir = getRunsDir();
             if (runsDir && !store.runTraces.has(item.runId)) {
                 store.runTraces.set(item.runId, loadTracesFromFile(path.join(runsDir, `${item.runId}.jsonl`)));
             }
 
-            // Refresh Selected Traces — getChildren will mark the selected item with arrow icon
             allTracesProvider.refresh();
-
-            // Show trace details in the detail panel
             detailProvider.showTrace(item.trace);
 
             try {
-                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(item.trace.source_file));
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(item.trace.source_file!));
                 const editor = await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false });
-                const decoratorLine = Math.max(0, item.trace.source_line_start - 2);
+                const decoratorLine = Math.max(0, item.trace.source_line_start! - 2);
                 editor.revealRange(
                     new vscode.Range(decoratorLine, 0, decoratorLine, 0),
                     vscode.TextEditorRevealType.InCenterIfOutsideViewport
@@ -595,13 +695,10 @@ export function activate(context: vscode.ExtensionContext) {
         }
     );
 
-    // File watcher
     const workspaceFolders = vscode.workspace.workspaceFolders;
     let watcher: vscode.FileSystemWatcher | undefined;
     if (workspaceFolders && workspaceFolders.length > 0) {
-        watcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern(workspaceFolders[0], 'runs/*.jsonl')
-        );
+        watcher = vscode.workspace.createFileSystemWatcher('**/runs/*.jsonl');
 
         watcher.onDidCreate(() => {
             provider.refresh();
@@ -634,25 +731,21 @@ export function activate(context: vscode.ExtensionContext) {
         context.subscriptions.push(watcher);
     }
 
-    // Active editor changed → apply decorations
     vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (editor && store.activeRunId) {
             decorationManager.applyToEditor(editor);
         }
     }, null, context.subscriptions);
 
-    // Cursor movement → filter sidebar to focused function
     vscode.window.onDidChangeTextEditorSelection((event) => {
         if (!store.activeRunId) { return; }
-
-        // If selectTrace just fired, skip this event and clear the flag
         if (store.suppressCursorFilter) {
             store.suppressCursorFilter = false;
             return;
         }
 
         const editor = event.textEditor;
-        const cursorLine = event.selections[0].active.line; // 0-indexed
+        const cursorLine = event.selections[0].active.line;
         const traces = store.runTraces.get(store.activeRunId) ?? [];
         const filePath = editor.document.uri.fsPath;
 
@@ -672,11 +765,9 @@ export function activate(context: vscode.ExtensionContext) {
         }
     }, null, context.subscriptions);
 
-    // Initial refresh
     provider.refresh();
     allTracesProvider.refresh();
 
-    // Apply decorations to already-open editors once traces are loaded
     if (store.activeRunId) {
         decorationManager.applyToAllVisibleEditors();
     }
@@ -686,7 +777,10 @@ export function activate(context: vscode.ExtensionContext) {
         allTracesView,
         detailView,
         hoverDisposable,
+        clearFocusCmd,
         openTraceUrlCmd,
+        restoreRunCodeCmd,
+        restoreMainCodeCmd,
         selectTraceCmd,
         { dispose: () => decorationManager.dispose() }
     );

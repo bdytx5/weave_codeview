@@ -37,6 +37,7 @@ module.exports = __toCommonJS(extension_exports);
 var vscode = __toESM(require("vscode"));
 var fs = __toESM(require("fs"));
 var path = __toESM(require("path"));
+var import_child_process = require("child_process");
 function parseRunLabel(stem) {
   const parts = stem.split("_");
   if (parts.length >= 2) {
@@ -66,7 +67,11 @@ function normaliseTrace(raw) {
     duration_s: raw["duration_s"] ?? 0,
     inputs: raw["inputs"] ?? {},
     output: raw["output"] ?? null,
-    error: raw["error"] ?? null
+    error: raw["error"] ?? null,
+    git_repo_root: raw["git_repo_root"] ?? null,
+    git_commit: raw["git_commit"] ?? null,
+    git_dirty: raw["git_dirty"] ?? false,
+    git_snapshot_sha: raw["git_snapshot_sha"] ?? null
   };
 }
 function loadTracesFromFile(filePath) {
@@ -101,14 +106,63 @@ function getRunsDir() {
   if (!folders || folders.length === 0) {
     return null;
   }
+  for (const folder of folders) {
+    const candidate = path.join(folder.uri.fsPath, "runs");
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
   return path.join(folders[0].uri.fsPath, "runs");
+}
+function getRunGitState(runId) {
+  const runsDir = getRunsDir();
+  if (!runsDir) {
+    return null;
+  }
+  const filePath = path.join(runsDir, `${runId}.jsonl`);
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+  let content;
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const raw = JSON.parse(trimmed);
+      return {
+        git_repo_root: raw["git_repo_root"] ?? null,
+        git_commit: raw["git_commit"] ?? null,
+        git_dirty: raw["git_dirty"] ?? false,
+        git_snapshot_sha: raw["git_snapshot_sha"] ?? null
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+function runGit(args, cwd) {
+  return (0, import_child_process.execSync)(["git", ...args].join(" "), { cwd, encoding: "utf8" }).trim();
 }
 var TraceRunItem = class extends vscode.TreeItem {
   constructor(runId) {
     super(parseRunLabel(runId), vscode.TreeItemCollapsibleState.Collapsed);
     this.runId = runId;
+    this.gitState = getRunGitState(runId);
+    const gs = this.gitState;
+    if (gs?.git_commit) {
+      const dirtyMark = gs.git_dirty ? "*" : "";
+      this.description = `${gs.git_commit}${dirtyMark}${gs.git_snapshot_sha ? "  \u{1F4F8}" : ""}`;
+    }
     this.iconPath = new vscode.ThemeIcon("history");
-    this.contextValue = "traceRun";
+    this.contextValue = gs?.git_snapshot_sha ? "traceRunWithSnapshot" : "traceRun";
   }
 };
 var TraceCallItem = class extends vscode.TreeItem {
@@ -224,8 +278,7 @@ var TraceDetailProvider = class {
     const items = [];
     items.push(new DetailItem("duration", `${trace.duration_s.toFixed(3)}s`));
     const ts = new Date(trace.timestamp_start * 1e3);
-    const timeStr = ts.toLocaleTimeString();
-    items.push(new DetailItem("called at", timeStr));
+    items.push(new DetailItem("called at", ts.toLocaleTimeString()));
     const inputEntries = Object.entries(trace.inputs);
     if (inputEntries.length === 0) {
       items.push(new DetailItem("inputs", "(none)"));
@@ -243,12 +296,7 @@ var TraceDetailProvider = class {
         }
         return new DetailItem(k, valStr);
       });
-      items.push(new DetailItem(
-        "inputs",
-        void 0,
-        vscode.TreeItemCollapsibleState.Expanded,
-        inputChildren
-      ));
+      items.push(new DetailItem("inputs", void 0, vscode.TreeItemCollapsibleState.Expanded, inputChildren));
     }
     if (trace.error) {
       const errChildren = [
@@ -347,8 +395,8 @@ var DecorationManager = class {
     });
   }
   applyToEditor(editor) {
-    const { activeRunId, runTraces, focusedFn, selectedCallId } = this.store;
-    if (!activeRunId) {
+    const { activeRunId, runTraces, focusedFn, selectedCallId, highlightActive } = this.store;
+    if (!activeRunId || !highlightActive) {
       editor.setDecorations(this._highlight, []);
       editor.setDecorations(this._gutter, []);
       return;
@@ -427,7 +475,7 @@ var TraceHoverProvider = class {
       md.appendMarkdown(`**Call ${i + 1}** \u2014 ${timeStr}  
 `);
       const inputsJson = JSON.stringify(t.inputs, null, 2);
-      const cappedInputs = inputsJson.length > 1e3 ? inputsJson.slice(0, 1e3) + "\u2026" : inputsJson;
+      const cappedInputs = inputsJson.length > 1e3 ? inputsJson.slice(0, 1e3) + "..." : inputsJson;
       md.appendMarkdown(`**Inputs:**
 \`\`\`json
 ${cappedInputs}
@@ -440,7 +488,7 @@ ${cappedInputs}
 `);
       } else {
         const outputStr = JSON.stringify(t.output, null, 2);
-        const cappedOutput = outputStr.length > 1e3 ? outputStr.slice(0, 1e3) + "\u2026" : outputStr;
+        const cappedOutput = outputStr.length > 1e3 ? outputStr.slice(0, 1e3) + "..." : outputStr;
         md.appendMarkdown(`**Output:**
 \`\`\`
 ${cappedOutput}
@@ -448,7 +496,7 @@ ${cappedOutput}
 `);
       }
       if (t.wandb_url) {
-        md.appendMarkdown(`[\u{1F369} View in W&B](${t.wandb_url})
+        md.appendMarkdown(`[View in W&B](${t.wandb_url})
 
 `);
       }
@@ -472,7 +520,8 @@ function activate(context) {
     runTraces: /* @__PURE__ */ new Map(),
     selectedCallId: null,
     focusedFn: null,
-    suppressCursorFilter: false
+    suppressCursorFilter: false,
+    highlightActive: true
   };
   const provider = new TraceTreeProvider(store);
   const allTracesProvider = new AllTracesProvider(store);
@@ -493,6 +542,17 @@ function activate(context) {
     { language: "python" },
     hoverProvider
   );
+  const clearFocusCmd = vscode.commands.registerCommand(
+    "cdweave.clearFocus",
+    () => {
+      store.highlightActive = false;
+      store.focusedFn = null;
+      store.selectedCallId = null;
+      provider.setFunctionFilter(null);
+      allTracesProvider.refresh();
+      decorationManager.clearAll();
+    }
+  );
   const openTraceUrlCmd = vscode.commands.registerCommand(
     "cdweave.openTraceUrl",
     (item) => {
@@ -500,7 +560,62 @@ function activate(context) {
       if (url) {
         vscode.env.openExternal(vscode.Uri.parse(url));
       } else {
-        vscode.window.showInformationMessage("CDWeave: No W&B URL available for this trace (missing op_name).");
+        vscode.window.showInformationMessage("CDWeave: No W&B URL available for this trace.");
+      }
+    }
+  );
+  const restoreRunCodeCmd = vscode.commands.registerCommand(
+    "cdweave.restoreRunCode",
+    async (item) => {
+      const gs = item.gitState;
+      if (!gs?.git_snapshot_sha || !gs.git_repo_root) {
+        vscode.window.showWarningMessage("CDWeave: No snapshot found for this run.");
+        return;
+      }
+      const shortSha = gs.git_snapshot_sha.slice(0, 8);
+      const choice = await vscode.window.showWarningMessage(
+        `Restore code from run "${parseRunLabel(item.runId)}"?
+
+This will overwrite your working tree with snapshot ${shortSha}. Uncommitted changes will be lost.`,
+        { modal: true },
+        "Restore"
+      );
+      if (choice !== "Restore") {
+        return;
+      }
+      try {
+        runGit(["checkout", gs.git_snapshot_sha, "--", "."], gs.git_repo_root);
+        vscode.window.showInformationMessage(`CDWeave: Working tree restored to snapshot ${shortSha}.`);
+      } catch (e) {
+        const err = e;
+        vscode.window.showErrorMessage(`CDWeave: git checkout failed \u2014 ${err.message ?? String(e)}`);
+      }
+    }
+  );
+  const restoreMainCodeCmd = vscode.commands.registerCommand(
+    "cdweave.restoreMainCode",
+    async (item) => {
+      const gs = item.gitState;
+      if (!gs?.git_repo_root) {
+        vscode.window.showWarningMessage("CDWeave: No git repo info for this run.");
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `Reset working tree back to HEAD?
+
+This will discard any uncommitted changes in ${gs.git_repo_root}.`,
+        { modal: true },
+        "Reset to HEAD"
+      );
+      if (choice !== "Reset to HEAD") {
+        return;
+      }
+      try {
+        runGit(["checkout", "HEAD", "--", "."], gs.git_repo_root);
+        vscode.window.showInformationMessage("CDWeave: Working tree reset to HEAD.");
+      } catch (e) {
+        const err = e;
+        vscode.window.showErrorMessage(`CDWeave: git checkout failed \u2014 ${err.message ?? String(e)}`);
       }
     }
   );
@@ -511,6 +626,7 @@ function activate(context) {
       store.selectedCallId = item.trace.call_id;
       store.focusedFn = item.trace.function;
       store.suppressCursorFilter = true;
+      store.highlightActive = true;
       const runsDir = getRunsDir();
       if (runsDir && !store.runTraces.has(item.runId)) {
         store.runTraces.set(item.runId, loadTracesFromFile(path.join(runsDir, `${item.runId}.jsonl`)));
@@ -534,9 +650,7 @@ function activate(context) {
   const workspaceFolders = vscode.workspace.workspaceFolders;
   let watcher;
   if (workspaceFolders && workspaceFolders.length > 0) {
-    watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(workspaceFolders[0], "runs/*.jsonl")
-    );
+    watcher = vscode.workspace.createFileSystemWatcher("**/runs/*.jsonl");
     watcher.onDidCreate(() => {
       provider.refresh();
       allTracesProvider.refresh();
@@ -601,7 +715,10 @@ function activate(context) {
     allTracesView,
     detailView,
     hoverDisposable,
+    clearFocusCmd,
     openTraceUrlCmd,
+    restoreRunCodeCmd,
+    restoreMainCodeCmd,
     selectTraceCmd,
     { dispose: () => decorationManager.dispose() }
   );

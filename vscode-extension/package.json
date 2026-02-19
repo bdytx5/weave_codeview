@@ -1,7 +1,8 @@
 {
-  "name": "cdweave-viewer",
-  "displayName": "CDWeave Trace Viewer",
-  "description": "View WV trace runs inside VSCode",
+  "publisher": "BrettYoung",
+  "name": "codeweave",
+  "displayName": "CodeWeave",
+  "description": "Visualize and restore Weave trace runs inside VSCode",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.85.0"
@@ -14,7 +15,7 @@
       "activitybar": [
         {
           "id": "cdweave-sidebar",
-          "title": "CDWeave Traces",
+          "title": "CodeWeave",
           "icon": "media/icon.svg"
         }
       ]
@@ -41,9 +42,30 @@
         "title": "Select CDWeave Trace"
       },
       {
+        "command": "cdweave.clearFocus",
+        "title": "CDWeave: Clear Highlight"
+      },
+      {
         "command": "cdweave.openTraceUrl",
-        "title": "🍩 Open in Weave",
+        "title": "Open in Weave",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "cdweave.restoreRunCode",
+        "title": "Restore run code",
+        "icon": "$(history)"
+      },
+      {
+        "command": "cdweave.restoreMainCode",
+        "title": "Back to HEAD",
+        "icon": "$(discard)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "cdweave.clearFocus",
+        "key": "escape",
+        "when": "editorTextFocus"
       }
     ],
     "menus": {
@@ -52,6 +74,16 @@
           "command": "cdweave.openTraceUrl",
           "when": "view =~ /cdweaveTraceTree|cdweaveAllTraces/ && viewItem == traceCallWithUrl",
           "group": "inline"
+        },
+        {
+          "command": "cdweave.restoreRunCode",
+          "when": "view == cdweaveTraceTree && viewItem == traceRunWithSnapshot",
+          "group": "inline@1"
+        },
+        {
+          "command": "cdweave.restoreMainCode",
+          "when": "view == cdweaveTraceTree && viewItem == traceRunWithSnapshot",
+          "group": "inline@2"
         }
       ]
     }
