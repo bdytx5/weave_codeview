@@ -175,9 +175,11 @@ weave.<span class="fn">finish</span>()                   <span class="cm"># flus
     <p>
       Git tracking is required to view runs after your code has changed. Without it, the extension can't show you which version of the code a run was recorded with.
     </p>
-    <p>
-      Set <code>weave.set_git_path("/path/to/your/repo")</code> before <code>weave.init()</code> and CodeWeave will automatically snapshot your code on every run — including any uncommitted changes — so you can always jump back to the exact code state a trace was run with.
-    </p>
+    <p>Either set it in code before <code>weave.init()</code>:</p>
+    <pre>weave.<span class="fn">set_git_path</span>(<span class="st">"/path/to/your/repo"</span>)</pre>
+    <p>Or via environment variable:</p>
+    <pre>export WEAVE_GIT_PATH=/path/to/your/repo</pre>
+    <p>CodeWeave will automatically snapshot your code on every run — including any uncommitted changes — so you can always jump back to the exact code state a trace was run with.</p>
   </section>
 
 
