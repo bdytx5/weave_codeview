@@ -138,6 +138,14 @@
   </header>
 
 
+  <!-- Install Options notice -->
+  <section>
+    <div class="tip">
+      <strong>Recommended:</strong> Install the <code>weavecode</code> PyPI package — it requires adding one line to your existing code. If you'd prefer zero changes to your existing code at all, see <a href="#fork" style="color:#a5f3fc;">Custom weave fork</a> at the bottom of this page.
+    </div>
+  </section>
+
+
   <!-- 1. VSCode Extension -->
   <section>
     <h2><span class="n">1</span> Install the VSCode Extension</h2>
@@ -146,55 +154,65 @@
   </section>
 
 
-  <!-- 2. Python Package -->
+  <!-- 2. weavecode package -->
   <section>
-    <h2><span class="n">2</span> Install the Python Package</h2>
-    <p>The custom CodeWeave build of Weave is <strong>required</strong> for the extension to work.</p>
-    <pre>pip install git+https://github.com/bdytx5/codeweave_package.git</pre>
-  </section>
-
-
-  <!-- 3. Usage -->
-  <section>
-    <h2><span class="n">3</span> Instrument Your Code</h2>
-    <p>Just call <code>weave.init()</code> with a project name — logging is automatic from there.</p>
+    <h2><span class="n">2</span> Install <code>weavecode</code></h2>
+    <p>Use this if you want to keep using the official <code>weave</code> package from PyPI and just add CodeWeave on top. No fork, no custom install — works with production releases of weave.</p>
+    <div class="tip"><strong>Note:</strong> The package is published as <code>weavecode</code> on PyPI — the name <code>codeweave</code> was already taken by an unrelated project.</div>
+    <pre>pip install weave weavecode</pre>
+    <p>Then wrap your <code>weave.init()</code> call with <code>weavecode.init()</code>. Everything else stays exactly the same.</p>
     <pre><span class="kw">import</span> weave
+<span class="kw">import</span> weavecode
 
-weave.<span class="fn">set_git_path</span>(<span class="st">"/path/to/your/repo"</span>)   <span class="cm"># path to your git repo</span>
-weave.<span class="fn">init</span>(<span class="st">"my-project"</span>)        <span class="cm"># all LLM calls are logged automatically</span>
+weavecode.<span class="fn">init</span>(weave.<span class="fn">init</span>(<span class="st">"my-project"</span>), git_path=<span class="st">"/path/to/your/repo"</span>)
+
+<span class="cm"># decorate your functions as normal</span>
+<span class="kw">@</span>weave.<span class="fn">op</span>
+<span class="kw">def</span> <span class="fn">my_fn</span>(): ...
 
 <span class="cm"># ... your code ...</span>
 
-weave.<span class="fn">finish</span>()                   <span class="cm"># flush &amp; close the run</span></pre>
-  </section>
-
-
-  <!-- 4. Git Tracking -->
-  <section>
-    <h2><span class="n">4</span> Git Tracking</h2>
-    <p>
-      Git tracking is required to view runs after your code has changed. Without it, the extension can't show you which version of the code a run was recorded with.
-    </p>
-    <p>Either set it in code before <code>weave.init()</code>:</p>
-    <pre>weave.<span class="fn">set_git_path</span>(<span class="st">"/path/to/your/repo"</span>)</pre>
-    <p>Or via environment variable:</p>
+weave.<span class="fn">finish</span>()</pre>
+    <p>You can also set the git path via environment variable instead of passing it in code:</p>
     <pre>export WEAVE_GIT_PATH=/path/to/your/repo</pre>
-    <p>CodeWeave will automatically snapshot your code on every run — including any uncommitted changes — so you can always jump back to the exact code state a trace was run with.</p>
   </section>
 
 
-  <!-- 5. View Runs -->
+  <!-- Terminal UI -->
   <section>
-    <h2><span class="n">5</span> View Runs in VSCode</h2>
+    <h2><span class="n">3</span> Terminal UI — <code>weavecode</code></h2>
+    <p>In addition to the VSCode extension, <code>weavecode</code> ships a standalone terminal UI you can run anywhere — no VSCode required. Just run:</p>
+    <pre>weavecode</pre>
+    <p>Or pass a project name directly:</p>
+    <pre>weavecode my-project</pre>
+    <p>The TUI shows all your logged runs, the full call tree for each run, source code at snapshot time with highlighted traces, and inputs/outputs/errors in a detail panel. Runs update in real time as new ones are logged.</p>
+    <img src="ss_tui.png" alt="weavecode terminal UI showing runs, call tree, and source viewer" />
+    <p class="caption">The weavecode terminal UI — browse runs, inspect call trees, and view the exact source code from the time of the run.</p>
+    <div class="tip">
+      <strong>Keybindings:</strong> &nbsp;
+      <code>p</code> pick project &nbsp;·&nbsp;
+      <code>r</code> back to runs &nbsp;·&nbsp;
+      <code>o</code> open in W&amp;B &nbsp;·&nbsp;
+      <code>c</code> copy trace &nbsp;·&nbsp;
+      <code>j</code> jump to callsite in VSCode &nbsp;·&nbsp;
+      <code>q</code> quit
+    </div>
+  </section>
+
+
+  <!-- 4. View Runs -->
+  <section>
+    <h2><span class="n">4</span> View Runs in VSCode</h2>
+
     <p>Open the CodeWeave panel in the sidebar. Click the project picker at the top to select your project — all projects with logged runs appear in the dropdown.</p>
     <img src="ss_runs.png" alt="CodeWeave project picker and runs list" />
     <p class="caption">Select a project to browse its runs. Each run shows a timestamp and the git commit it was recorded at.</p>
   </section>
 
 
-  <!-- 6. Trace Viewer -->
+  <!-- 5. Trace Viewer -->
   <section>
-    <h2><span class="n">6</span> Viewing Traces</h2>
+    <h2><span class="n">5</span> Viewing Traces</h2>
     <p>Click any run to expand its calls. Select a call to see inputs, outputs, duration, and the exact line of code it was called from — highlighted live in the editor.</p>
     <img src="ss_viewer.png" alt="CodeWeave trace viewer showing calls and detail panel" />
   </section>
@@ -213,6 +231,29 @@ weave.<span class="fn">finish</span>()                   <span class="cm"># flus
         style="position:absolute;top:0;left:0;width:100%;height:100%;">
       </iframe>
     </div>
+  </section>
+
+
+  <!-- Custom fork (advanced) -->
+  <section id="fork" style="border-top: 1px solid #2d3748; padding-top: 2rem;">
+    <h2>Advanced — Custom weave fork</h2>
+    <p>If you'd prefer not to add any <code>weavecode</code> import to your code, this option bakes the CodeWeave integration directly into weave. The API is identical to the official package — no wrapper calls needed.</p>
+    <pre>pip install git+https://github.com/bdytx5/codeweave_package.git</pre>
+    <p>Then just use <code>weave</code> directly:</p>
+    <pre><span class="kw">import</span> weave
+
+weave.<span class="fn">set_git_path</span>(<span class="st">"/path/to/your/repo"</span>)   <span class="cm"># or set WEAVE_GIT_PATH env var</span>
+weave.<span class="fn">init</span>(<span class="st">"my-project"</span>)
+
+<span class="kw">@</span>weave.<span class="fn">op</span>
+<span class="kw">def</span> <span class="fn">my_fn</span>(): ...
+
+<span class="cm"># ... your code ...</span>
+
+weave.<span class="fn">finish</span>()</pre>
+    <p>You can also set the git path via environment variable:</p>
+    <pre>export WEAVE_GIT_PATH=/path/to/your/repo</pre>
+    <div class="tip"><strong>Note:</strong> This installs a patched fork of weave and will override your existing <code>weave</code> install. Use <code>weavecode</code> instead if you want to keep the official weave package untouched and don't mind adding one line to your code.</div>
   </section>
 
 
