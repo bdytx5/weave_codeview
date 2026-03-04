@@ -1,0 +1,11 @@
+pyproject.toml
+codeweave/__init__.py
+codeweave/_git.py
+codeweave/_logger.py
+codeweave/_tui.py
+codeweave.egg-info/PKG-INFO
+codeweave.egg-info/SOURCES.txt
+codeweave.egg-info/dependency_links.txt
+codeweave.egg-info/entry_points.txt
+codeweave.egg-info/requires.txt
+codeweave.egg-info/top_level.txt

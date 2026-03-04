@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: codeweave
+Version: 0.1.0
+Summary: Local JSONL logging and git snapshotting for Weave traces
+Project-URL: Homepage, https://github.com/bdytx5/codeweave_package
+Requires-Python: >=3.8
+Requires-Dist: textual>=0.50.0
