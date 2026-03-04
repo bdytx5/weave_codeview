@@ -1,2 +1,3 @@
 [console_scripts]
 codeweave = codeweave._tui:main
+codeweave-sanity = codeweave._sanity:main

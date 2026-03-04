@@ -2,6 +2,7 @@ pyproject.toml
 codeweave/__init__.py
 codeweave/_git.py
 codeweave/_logger.py
+codeweave/_sanity.py
 codeweave/_tui.py
 codeweave.egg-info/PKG-INFO
 codeweave.egg-info/SOURCES.txt

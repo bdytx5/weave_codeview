@@ -17,6 +17,17 @@ from rich.text import Text
 
 CACHE_DIR = Path(os.path.expanduser("~")) / ".cache" / "codeweave"
 LAST_PROJECT_FILE = CACHE_DIR / ".last_project"
+DEBUG_LOG = CACHE_DIR / "exception_log.txt"
+
+def _dbg(msg: str) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG.open("a") as f:
+            import traceback, datetime
+            f.write(f"\n[{datetime.datetime.now().isoformat()}] {msg}\n")
+            f.write(traceback.format_exc() if traceback.format_exc().strip() != "NoneType: None" else "")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -113,7 +124,10 @@ def _short(val: Any, maxlen: int = 120) -> str:
 class CodeWeaveApp(App):
 
     CSS = """
-    Screen { layout: vertical; }
+    Screen {
+        layout: vertical;
+        overflow: hidden hidden;
+    }
 
     #top-bar {
         height: 1;
@@ -130,18 +144,21 @@ class CodeWeaveApp(App):
     #left {
         width: 34;
         layout: vertical;
+        overflow: hidden hidden;
         border-right: solid $accent-darken-2;
     }
 
     #runs-box {
         height: 35%;
+        layout: vertical;
+        overflow: hidden hidden;
         border-bottom: solid $accent-darken-2;
-        overflow-y: auto;
     }
 
     #calls-box {
         height: 1fr;
-        overflow-y: auto;
+        layout: vertical;
+        overflow: hidden hidden;
     }
 
     .box-title {
@@ -153,20 +170,27 @@ class CodeWeaveApp(App):
 
     ListView, Tree {
         width: 100%;
-        height: 100%;
+        height: 1fr;
     }
 
     #right {
         width: 1fr;
         layout: vertical;
+        overflow: hidden hidden;
     }
 
     #code-box {
         height: 60%;
+        layout: vertical;
+        overflow: hidden hidden;
         border-bottom: solid $accent-darken-2;
     }
 
-    #detail-box { height: 1fr; }
+    #detail-box {
+        height: 1fr;
+        layout: vertical;
+        overflow: hidden hidden;
+    }
 
     #action-bar {
         height: 1;
@@ -177,7 +201,7 @@ class CodeWeaveApp(App):
 
     VerticalScroll {
         width: 100%;
-        height: 100%;
+        height: 1fr;
     }
 
     RichLog {
@@ -234,10 +258,12 @@ class CodeWeaveApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        _dbg(f"[5] on_mount fired, project={self._project}, run_ids will load now")
         self.title = "CodeWeave"
         self._update_top_bar()
         self._load_runs()
         self.query_one("#runs-list", ListView).focus()
+
 
     # ------------------------------------------------------------------
     # Data
@@ -268,7 +294,9 @@ class CodeWeaveApp(App):
         self.query_one("#calls-tree", Tree).reset(label)
 
     def _load_calls(self, run_id: str) -> None:
+        _dbg(f"[3] _load_calls fired, run_id={run_id}, records will load from project={self._project}")
         self._records = _load_run(self._project, run_id)  # type: ignore[arg-type]
+        _dbg(f"[3] _load_calls loaded {len(self._records)} records")
 
         self._reset_tree(_parse_run_label(run_id))
         tree = self.query_one("#calls-tree", Tree)
@@ -304,10 +332,15 @@ class CodeWeaveApp(App):
         dv.write(Text("Select a call to view details.", style="dim italic"))
 
     def _show_call(self, record: dict) -> None:
-        self._selected = record
-        self._render_source(record)
-        self._render_detail(record)
-        self._set_active("code-box")
+        _dbg(f"[4] _show_call fired, fn={_fn_name(record)}, src_file={record.get('source_file')}")
+        try:
+            self._selected = record
+            self._render_source(record)
+            self._render_detail(record)
+            self._set_active("code-box")
+            self.query_one("#code-scroll", VerticalScroll).focus()
+        except Exception as e:
+            _dbg(f"[4] EXCEPTION in _show_call: {e}")
 
     def _render_source(self, record: dict) -> None:
         cv = self.query_one("#code-viewer", RichLog)
@@ -428,14 +461,22 @@ class CodeWeaveApp(App):
     # ------------------------------------------------------------------
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
-        if idx is not None and idx < len(self._run_ids):
-            self._load_calls(self._run_ids[idx])
+        _dbg(f"[1] on_list_view_selected fired, index={event.list_view.index}")
+        try:
+            idx = event.list_view.index
+            if idx is not None and idx < len(self._run_ids):
+                self._load_calls(self._run_ids[idx])
+        except Exception as e:
+            _dbg(f"[1] EXCEPTION in on_list_view_selected: {e}")
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-        record = event.node.data
-        if record:
-            self._show_call(record)
+        _dbg(f"[2] on_tree_node_highlighted fired, node={event.node.label}, has_data={event.node.data is not None}")
+        try:
+            record = event.node.data
+            if record:
+                self._show_call(record)
+        except Exception as e:
+            _dbg(f"[2] EXCEPTION in on_tree_node_highlighted: {e}")
 
     # ------------------------------------------------------------------
     # Actions
@@ -551,8 +592,8 @@ def main() -> None:
     # Fix mouse clicks in iTerm2 (textual >= 2.0 requires LC_TERMINAL to be set)
     if not os.environ.get("LC_TERMINAL"):
         os.environ["LC_TERMINAL"] = "iTerm2"
-    size = _patch_textual_size()
-    CodeWeaveApp(project=project).run(mouse=True, size=size)
+    _patch_textual_size()
+    CodeWeaveApp(project=project).run()
 
 
 if __name__ == "__main__":
