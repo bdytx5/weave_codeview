@@ -3,7 +3,7 @@
   "name": "codeweave",
   "displayName": "CodeWeave",
   "description": "Visualize and restore Weave trace runs inside VSCode",
-  "version": "0.0.2",
+  "version": "0.0.39",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -46,6 +46,11 @@
         "title": "Select CDWeave Trace"
       },
       {
+        "command": "cdweave.show",
+        "title": "CodeWeave: Show Panel",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "cdweave.clearFocus",
         "title": "CDWeave: Clear Highlight"
       },
@@ -63,6 +68,30 @@
         "command": "cdweave.restoreMainCode",
         "title": "Back to HEAD",
         "icon": "$(discard)"
+      },
+      {
+        "command": "cdweave.selectProject",
+        "title": "Select Project",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "cdweave.unlockFiles",
+        "title": "CodeWeave: Unlock Files"
+      },
+      {
+        "command": "cdweave.copyRunTraces",
+        "title": "Copy Traces",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "cdweave.copyTrace",
+        "title": "Copy Trace",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "cdweave.goToCallSite",
+        "title": "Go to Call Site",
+        "icon": "$(target)"
       }
     ],
     "keybindings": [
@@ -73,6 +102,19 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "cdweave.show",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "cdweave.selectProject",
+          "when": "view == cdweaveTraceTree",
+          "group": "navigation"
+        }
+      ],
       "view/item/context": [
         {
           "command": "cdweave.openTraceUrl",
@@ -85,9 +127,19 @@
           "group": "inline@1"
         },
         {
-          "command": "cdweave.restoreMainCode",
-          "when": "view == cdweaveTraceTree && viewItem == traceRunWithSnapshot",
+          "command": "cdweave.copyRunTraces",
+          "when": "view == cdweaveTraceTree && viewItem =~ /traceRun/",
           "group": "inline@2"
+        },
+        {
+          "command": "cdweave.copyTrace",
+          "when": "view =~ /cdweaveTraceTree|cdweaveAllTraces/ && viewItem =~ /traceCall/",
+          "group": "inline"
+        },
+        {
+          "command": "cdweave.goToCallSite",
+          "when": "view =~ /cdweaveTraceTree|cdweaveAllTraces/ && viewItem =~ /traceCall/",
+          "group": "inline"
         }
       ]
     }

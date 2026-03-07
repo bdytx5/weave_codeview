@@ -55,23 +55,33 @@ function normaliseTrace(raw) {
     const opName = raw["op_name"];
     fnName = opName.split("/").pop()?.split(":")[0] ?? opName;
   }
+  if (!fnName) {
+    fnName = raw["callsite_function"] ?? null;
+  }
+  const sourceFile = raw["source_file"] ?? raw["callsite_file"] ?? null;
+  const sourceLineStart = raw["source_line_start"] ?? raw["callsite_line"] ?? null;
+  const sourceLineEnd = raw["source_line_end"] ?? raw["callsite_line"] ?? null;
   return {
     call_id: raw["call_id"],
     function: fnName ?? "(unknown)",
     op_name: raw["op_name"] ?? null,
     wandb_url: raw["wandb_url"] ?? null,
-    source_file: raw["source_file"] ?? null,
-    source_line_start: raw["source_line_start"] ?? null,
-    source_line_end: raw["source_line_end"] ?? null,
+    source_file: sourceFile,
+    source_line_start: sourceLineStart,
+    source_line_end: sourceLineEnd,
     timestamp_start: raw["timestamp_start"],
     duration_s: raw["duration_s"] ?? 0,
     inputs: raw["inputs"] ?? {},
     output: raw["output"] ?? null,
     error: raw["error"] ?? null,
+    parent_id: raw["parent_id"] ?? null,
+    trace_id: raw["trace_id"] ?? null,
     git_repo_root: raw["git_repo_root"] ?? null,
     git_commit: raw["git_commit"] ?? null,
     git_dirty: raw["git_dirty"] ?? false,
-    git_snapshot_sha: raw["git_snapshot_sha"] ?? null
+    git_snapshot_sha: raw["git_snapshot_sha"] ?? null,
+    callsite_file: raw["callsite_file"] ?? null,
+    callsite_line: raw["callsite_line"] ?? null
   };
 }
 function loadTracesFromFile(filePath) {
@@ -107,7 +117,13 @@ function runEnvironmentChecks() {
     return;
   }
   const wsRoot = folders[0].uri.fsPath;
-  const isGitRepo = fs.existsSync(path.join(wsRoot, ".git"));
+  let isGitRepo = false;
+  try {
+    const result = (0, import_child_process.execSync)("git rev-parse --show-toplevel", { cwd: wsRoot, encoding: "utf8" }).trim();
+    isGitRepo = result.length > 0;
+  } catch {
+    isGitRepo = false;
+  }
   if (!isGitRepo) {
     vscode.window.showWarningMessage(
       "CodeWeave: No git repo found in workspace. Code restore features will not work.",
@@ -140,24 +156,23 @@ function runEnvironmentChecks() {
     });
   }
 }
-function getRunsDir() {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    return null;
+var CODEWEAVE_CACHE = path.join(
+  process.env["HOME"] || process.env["USERPROFILE"] || "~",
+  ".cache",
+  "codeweave"
+);
+function getProjects() {
+  try {
+    return fs.readdirSync(CODEWEAVE_CACHE).filter((f) => fs.statSync(path.join(CODEWEAVE_CACHE, f)).isDirectory()).sort();
+  } catch {
+    return [];
   }
-  for (const folder of folders) {
-    const candidate = path.join(folder.uri.fsPath, "runs");
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return path.join(folders[0].uri.fsPath, "runs");
 }
-function getRunGitState(runId) {
-  const runsDir = getRunsDir();
-  if (!runsDir) {
-    return null;
-  }
+function getRunsDir(project) {
+  return path.join(CODEWEAVE_CACHE, project);
+}
+function getRunGitState(runId, project) {
+  const runsDir = getRunsDir(project);
   const filePath = path.join(runsDir, `${runId}.jsonl`);
   if (!fs.existsSync(filePath)) {
     return null;
@@ -197,6 +212,26 @@ function getCurrentHeadSha(repoRoot) {
     return null;
   }
 }
+function getActualRepoRoot(recordedRoot) {
+  const candidates = [];
+  if (recordedRoot) {
+    candidates.push(recordedRoot);
+  }
+  for (const f of vscode.workspace.workspaceFolders ?? []) {
+    candidates.push(f.uri.fsPath);
+  }
+  for (const c of candidates) {
+    try {
+      const root = runGit(["rev-parse", "--show-toplevel"], c);
+      if (root) {
+        return root;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 function hasUncommittedChanges(repoRoot) {
   try {
     return runGit(["status", "--porcelain"], repoRoot).length > 0;
@@ -205,10 +240,11 @@ function hasUncommittedChanges(repoRoot) {
   }
 }
 var TraceRunItem = class extends vscode.TreeItem {
-  constructor(runId) {
+  constructor(runId, project) {
     super(parseRunLabel(runId), vscode.TreeItemCollapsibleState.Collapsed);
     this.runId = runId;
-    this.gitState = getRunGitState(runId);
+    this.project = project;
+    this.gitState = getRunGitState(runId, project);
     const gs = this.gitState;
     if (gs?.git_commit) {
       const dirtyMark = gs.git_dirty ? "*" : "";
@@ -219,8 +255,8 @@ var TraceRunItem = class extends vscode.TreeItem {
   }
 };
 var TraceCallItem = class extends vscode.TreeItem {
-  constructor(trace, runId, selected = false) {
-    super(trace.function, vscode.TreeItemCollapsibleState.None);
+  constructor(trace, runId, selected = false, hasChildren = false) {
+    super(trace.function, hasChildren ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
     this.trace = trace;
     this.runId = runId;
     this.description = `${trace.duration_s.toFixed(3)}s${trace.wandb_url ? "  \u{1F369}" : ""}`;
@@ -246,17 +282,26 @@ var TraceTreeProvider = class {
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
   }
   refresh() {
-    const runsDir = getRunsDir();
-    if (runsDir) {
-      try {
-        const files = fs.readdirSync(runsDir).filter((f) => f.endsWith(".jsonl")).sort().reverse();
-        if (files.length > 0 && this.store.activeRunId === null) {
-          this.store.activeRunId = files[0].replace(/\.jsonl$/, "");
-        }
-      } catch {
+    if (!this.store.activeProject) {
+      const projects = getProjects();
+      if (projects.length > 0) {
+        this.store.activeProject = projects[0];
       }
     }
+    this._updateTitle();
     this._onDidChangeTreeData.fire();
+  }
+  setProject(project) {
+    this.store.activeProject = project;
+    this.store.activeRunId = null;
+    this.store.runTraces.clear();
+    this._updateTitle();
+    this._onDidChangeTreeData.fire();
+  }
+  _updateTitle() {
+    if (this.treeView) {
+      this.treeView.title = this.store.activeProject ? `Runs \u2014 ${this.store.activeProject}` : "Runs";
+    }
   }
   setFunctionFilter(fnName) {
     this.store.focusedFn = fnName;
@@ -271,48 +316,34 @@ var TraceTreeProvider = class {
   }
   getChildren(element) {
     if (!element) {
-      const runsDir = getRunsDir();
-      if (!runsDir) {
+      if (!this.store.activeProject) {
         return [];
       }
-      let files = [];
+      const runsDir = getRunsDir(this.store.activeProject);
+      let runIds = [];
       try {
-        files = fs.readdirSync(runsDir).filter((f) => f.endsWith(".jsonl")).sort().reverse();
+        runIds = fs.readdirSync(runsDir).filter((f) => f.endsWith(".jsonl")).map((f) => f.replace(/\.jsonl$/, "")).sort().reverse();
       } catch {
         return [];
       }
-      return files.map((f) => new TraceRunItem(f.replace(/\.jsonl$/, "")));
+      return runIds.map((id) => new TraceRunItem(id, this.store.activeProject));
     }
     if (element instanceof TraceRunItem) {
       const runId = element.runId;
+      const project = element.project;
       if (!this.store.runTraces.has(runId)) {
-        const runsDir = getRunsDir();
-        if (!runsDir) {
-          return [];
-        }
+        const runsDir = getRunsDir(project);
         const traces2 = loadTracesFromFile(path.join(runsDir, `${runId}.jsonl`));
         this.store.runTraces.set(runId, traces2);
       }
       const traces = this.store.runTraces.get(runId) ?? [];
-      const gs = element.gitState;
-      if (gs?.git_repo_root) {
-        const currentHead = getCurrentHeadSha(gs.git_repo_root);
-        const runCommit = gs.git_dirty ? gs.git_snapshot_sha?.slice(0, 8) : gs.git_commit;
-        const isStale = gs.git_dirty ? gs.git_snapshot_sha !== null : currentHead !== null && gs.git_commit !== null && !currentHead.startsWith(gs.git_commit) && !gs.git_commit.startsWith(currentHead);
-        if (isStale) {
-          const label = parseRunLabel(runId);
-          const runDesc = gs.git_dirty ? `snapshot ${gs.git_snapshot_sha?.slice(0, 8)}` : `commit ${gs.git_commit}`;
-          vscode.window.showWarningMessage(
-            `CDWeave: Run "${label}" was recorded at a different code version (${runDesc}, current HEAD: ${currentHead ?? "unknown"}).`,
-            "Switch to this code"
-          ).then((choice) => {
-            if (choice === "Switch to this code") {
-              vscode.commands.executeCommand("cdweave.restoreRunCode", element);
-            }
-          });
-        }
-      }
-      return traces.map((t) => new TraceCallItem(t, runId));
+      const childIds = new Set(traces.filter((t) => t.parent_id).map((t) => t.parent_id));
+      return traces.filter((t) => !t.parent_id).map((t) => new TraceCallItem(t, runId, false, childIds.has(t.call_id)));
+    }
+    if (element instanceof TraceCallItem) {
+      const traces = this.store.runTraces.get(element.runId) ?? [];
+      const childIds = new Set(traces.filter((t) => t.parent_id).map((t) => t.parent_id));
+      return traces.filter((t) => t.parent_id === element.trace.call_id).map((t) => new TraceCallItem(t, element.runId, false, childIds.has(t.call_id)));
     }
     return [];
   }
@@ -321,7 +352,7 @@ var TraceTreeProvider = class {
       return null;
     }
     if (element instanceof TraceCallItem) {
-      return new TraceRunItem(element.runId);
+      return new TraceRunItem(element.runId, this.store.activeProject ?? "");
     }
     return null;
   }
@@ -485,13 +516,13 @@ var DecorationManager = class {
       }
     }
     let highlightTraces = fileTraces;
-    if (focusedFn) {
-      highlightTraces = highlightTraces.filter((t) => t.function === focusedFn);
-    } else if (selectedCallId) {
+    if (selectedCallId) {
       const selected = highlightTraces.filter((t) => t.call_id === selectedCallId);
       if (selected.length > 0) {
         highlightTraces = selected;
       }
+    } else if (focusedFn) {
+      highlightTraces = highlightTraces.filter((t) => t.function === focusedFn);
     }
     const highlightRanges = highlightTraces.map((t) => {
       const startLine = Math.max(0, t.source_line_start - 2);
@@ -586,15 +617,17 @@ ${cappedOutput}
   }
 };
 function activate(context) {
+  const savedProject = context.globalState.get("activeProject") ?? null;
   const store = {
     activeRunId: null,
+    activeProject: savedProject,
     runTraces: /* @__PURE__ */ new Map(),
     selectedCallId: null,
     focusedFn: null,
     suppressCursorFilter: false,
     highlightActive: true,
     snapshotRepoRoot: null,
-    snapshotDidStash: false
+    snapshotOriginalCommit: null
   };
   const provider = new TraceTreeProvider(store);
   const allTracesProvider = new AllTracesProvider(store);
@@ -607,33 +640,21 @@ function activate(context) {
   snapshotStatusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
   snapshotStatusBar.command = "cdweave.restoreMainCode";
   context.subscriptions.push(snapshotStatusBar);
-  function enterSnapshotMode(repoRoot, didStash) {
+  function enterSnapshotMode(repoRoot, originalCommit) {
     store.snapshotRepoRoot = repoRoot;
-    store.snapshotDidStash = didStash;
+    store.snapshotOriginalCommit = originalCommit;
     snapshotStatusBar.show();
-    const config = vscode.workspace.getConfiguration("files");
-    config.update("readonlyInclude", { "**/*": true }, vscode.ConfigurationTarget.Workspace);
   }
   function exitSnapshotMode() {
-    const repoRoot = store.snapshotRepoRoot;
-    const didStash = store.snapshotDidStash;
     store.snapshotRepoRoot = null;
-    store.snapshotDidStash = false;
+    store.snapshotOriginalCommit = null;
     snapshotStatusBar.hide();
-    const config = vscode.workspace.getConfiguration("files");
-    config.update("readonlyInclude", void 0, vscode.ConfigurationTarget.Workspace);
-    if (didStash && repoRoot) {
-      try {
-        runGit(["stash", "pop"], repoRoot);
-      } catch {
-        vscode.window.showWarningMessage('CDWeave: Could not auto-pop stash. Run "git stash pop" manually.');
-      }
-    }
   }
   const treeView = vscode.window.createTreeView("cdweaveTraceTree", {
     treeDataProvider: provider,
     showCollapseAll: true
   });
+  provider.treeView = treeView;
   const allTracesView = vscode.window.createTreeView("cdweaveAllTraces", {
     treeDataProvider: allTracesProvider
   });
@@ -644,6 +665,12 @@ function activate(context) {
     { language: "python" },
     hoverProvider
   );
+  const unlockFilesCmd = vscode.commands.registerCommand("cdweave.unlockFiles", () => {
+    store.snapshotRepoRoot = null;
+    store.snapshotOriginalCommit = null;
+    snapshotStatusBar.hide();
+    vscode.window.showInformationMessage("CodeWeave: Snapshot mode cleared.");
+  });
   const clearFocusCmd = vscode.commands.registerCommand(
     "cdweave.clearFocus",
     () => {
@@ -675,23 +702,38 @@ function activate(context) {
         return;
       }
       const shortSha = gs.git_snapshot_sha.slice(0, 8);
-      const choice = await vscode.window.showWarningMessage(
-        `View code from run "${parseRunLabel(item.runId)}" (snapshot ${shortSha})?
-
-Your current changes will be stashed and restored when you click "Back to current code".`,
-        { modal: true },
-        "View snapshot"
-      );
-      if (choice !== "View snapshot") {
-        return;
+      const repoRoot = getActualRepoRoot(gs.git_repo_root);
+      const effectiveRoot = repoRoot ?? gs.git_repo_root;
+      const dirty = hasUncommittedChanges(effectiveRoot);
+      if (dirty) {
+        const choice = await vscode.window.showErrorMessage(
+          "CodeWeave: You have uncommitted changes. Commit them first.",
+          { modal: true },
+          "Commit Now"
+        );
+        if (choice !== "Commit Now") {
+          return;
+        }
+        const msg = await vscode.window.showInputBox({
+          prompt: "Commit message",
+          value: "wip"
+        });
+        if (!msg) {
+          return;
+        }
+        try {
+          runGit(["add", "-A"], effectiveRoot);
+          runGit(["commit", "-m", msg], effectiveRoot);
+        } catch (e) {
+          const err = e;
+          vscode.window.showErrorMessage(`CodeWeave: Commit failed \u2014 ${err.message ?? String(e)}`);
+          return;
+        }
       }
       try {
-        const dirty = hasUncommittedChanges(gs.git_repo_root);
-        if (dirty) {
-          runGit(["stash", "push", "-u", "-m", `cdweave: before snapshot ${shortSha}`], gs.git_repo_root);
-        }
-        runGit(["checkout", gs.git_snapshot_sha, "--", "."], gs.git_repo_root);
-        enterSnapshotMode(gs.git_repo_root, dirty);
+        const currentCommit = getCurrentHeadSha(effectiveRoot);
+        runGit(["checkout", gs.git_snapshot_sha, "--", "."], effectiveRoot);
+        enterSnapshotMode(effectiveRoot, currentCommit);
       } catch (e) {
         const err = e;
         vscode.window.showErrorMessage(`CDWeave: Restore failed \u2014 ${err.message ?? String(e)}`);
@@ -707,12 +749,93 @@ Your current changes will be stashed and restored when you click "Back to curren
         return;
       }
       try {
-        runGit(["checkout", "HEAD", "--", "."], repoRoot);
+        const restoreTarget = store.snapshotOriginalCommit ?? getCurrentHeadSha(repoRoot);
+        if (restoreTarget) {
+          runGit(["reset", "--hard", restoreTarget], repoRoot);
+        }
         exitSnapshotMode();
-        vscode.window.showInformationMessage("CDWeave: Restored to current code (HEAD).");
+        vscode.window.showInformationMessage("CDWeave: Restored to current code.");
       } catch (e) {
         const err = e;
         vscode.window.showErrorMessage(`CDWeave: Restore failed \u2014 ${err.message ?? String(e)}`);
+      }
+    }
+  );
+  function formatValue(val, indent) {
+    const pad = "  ".repeat(indent);
+    if (val === null || val === void 0) {
+      return "null";
+    }
+    if (typeof val === "string") {
+      return val;
+    }
+    if (typeof val !== "object") {
+      return String(val);
+    }
+    const entries = Object.entries(val);
+    if (entries.length === 0) {
+      return "{}";
+    }
+    return "\n" + entries.map(([k, v]) => `${pad}- ${k}: ${formatValue(v, indent + 1)}`).join("\n");
+  }
+  function formatTrace(t) {
+    const name = t.function;
+    const lines = [];
+    lines.push(`[${name}]`);
+    lines.push(`  inputs: ${formatValue(t.inputs, 2)}`);
+    if (t.error) {
+      const errStr = typeof t.error === "string" ? t.error : `${t.error.type}: ${t.error.message}`;
+      lines.push(`  error: ${errStr}`);
+    } else {
+      lines.push(`  output: ${formatValue(t.output, 2)}`);
+    }
+    return lines.join("\n");
+  }
+  const copyRunTracesCmd = vscode.commands.registerCommand(
+    "cdweave.copyRunTraces",
+    async (item) => {
+      const runsDir = getRunsDir(item.project);
+      const traces = loadTracesFromFile(path.join(runsDir, `${item.runId}.jsonl`));
+      if (traces.length === 0) {
+        vscode.window.showInformationMessage("CDWeave: No traces found for this run.");
+        return;
+      }
+      const outerTraces = traces.filter((t) => !t.parent_id);
+      await vscode.env.clipboard.writeText(outerTraces.map(formatTrace).join("\n\n"));
+      const choice = await vscode.window.showInformationMessage(
+        `CDWeave: Copied ${outerTraces.length} outer trace(s). Copy all ${traces.length} (including nested)?`,
+        "Copy All"
+      );
+      if (choice === "Copy All") {
+        await vscode.env.clipboard.writeText(traces.map(formatTrace).join("\n\n"));
+        vscode.window.showInformationMessage(`CDWeave: Copied all ${traces.length} trace(s).`);
+      }
+    }
+  );
+  const copyTraceCmd = vscode.commands.registerCommand(
+    "cdweave.copyTrace",
+    async (item) => {
+      await vscode.env.clipboard.writeText(formatTrace(item.trace));
+      vscode.window.showInformationMessage("CDWeave: Copied trace to clipboard.");
+    }
+  );
+  const goToCallSiteCmd = vscode.commands.registerCommand(
+    "cdweave.goToCallSite",
+    async (item) => {
+      const file = item.trace.callsite_file;
+      const line = item.trace.callsite_line;
+      if (!file || line === null) {
+        vscode.window.showInformationMessage("CDWeave: No call site info available for this trace.");
+        return;
+      }
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+        const editor = await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false });
+        const pos = new vscode.Position(line - 1, 0);
+        editor.selection = new vscode.Selection(pos, pos);
+        editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+      } catch {
+        vscode.window.showErrorMessage(`CDWeave: Could not open ${file}`);
       }
     }
   );
@@ -724,57 +847,56 @@ Your current changes will be stashed and restored when you click "Back to curren
       store.focusedFn = item.trace.function;
       store.suppressCursorFilter = true;
       store.highlightActive = true;
-      const runsDir = getRunsDir();
-      if (runsDir && !store.runTraces.has(item.runId)) {
+      if (!store.runTraces.has(item.runId)) {
+        const runsDir = getRunsDir(store.activeProject);
         store.runTraces.set(item.runId, loadTracesFromFile(path.join(runsDir, `${item.runId}.jsonl`)));
       }
       allTracesProvider.refresh();
       detailProvider.showTrace(item.trace);
-      try {
-        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(item.trace.source_file));
-        const editor = await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false });
-        const decoratorLine = Math.max(0, item.trace.source_line_start - 2);
-        editor.revealRange(
-          new vscode.Range(decoratorLine, 0, decoratorLine, 0),
-          vscode.TextEditorRevealType.InCenterIfOutsideViewport
-        );
-        decorationManager.applyToAllVisibleEditors();
-      } catch {
-        vscode.window.showErrorMessage(`CDWeave: Could not open ${item.trace.source_file}`);
+      if (item.trace.source_file) {
+        try {
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(item.trace.source_file));
+          const editor = await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false });
+          const decoratorLine = Math.max(0, item.trace.source_line_start - 2);
+          editor.revealRange(
+            new vscode.Range(decoratorLine, 0, decoratorLine, 0),
+            vscode.TextEditorRevealType.InCenterIfOutsideViewport
+          );
+          decorationManager.applyToAllVisibleEditors();
+        } catch {
+          vscode.window.showErrorMessage(`CDWeave: Could not open ${item.trace.source_file}`);
+        }
       }
     }
   );
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  let watcher;
-  if (workspaceFolders && workspaceFolders.length > 0) {
-    watcher = vscode.workspace.createFileSystemWatcher("**/runs/*.jsonl");
-    watcher.onDidCreate(() => {
-      provider.refresh();
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(vscode.Uri.file(CODEWEAVE_CACHE), "**/*.jsonl")
+  );
+  watcher.onDidCreate(() => {
+    provider.refresh();
+    allTracesProvider.refresh();
+  });
+  watcher.onDidChange((uri) => {
+    const runId = path.basename(uri.fsPath, ".jsonl");
+    provider.invalidateRun(runId);
+    if (runId === store.activeRunId) {
+      store.runTraces.set(runId, loadTracesFromFile(uri.fsPath));
       allTracesProvider.refresh();
-    });
-    watcher.onDidChange((uri) => {
-      const runId = path.basename(uri.fsPath, ".jsonl");
-      provider.invalidateRun(runId);
-      const runsDir = getRunsDir();
-      if (runId === store.activeRunId && runsDir) {
-        store.runTraces.set(runId, loadTracesFromFile(uri.fsPath));
-        allTracesProvider.refresh();
-        decorationManager.applyToAllVisibleEditors();
-      }
-    });
-    watcher.onDidDelete((uri) => {
-      const runId = path.basename(uri.fsPath, ".jsonl");
-      store.runTraces.delete(runId);
-      if (store.activeRunId === runId) {
-        store.activeRunId = null;
-        store.selectedCallId = null;
-        decorationManager.clearAll();
-      }
-      provider.refresh();
-      allTracesProvider.refresh();
-    });
-    context.subscriptions.push(watcher);
-  }
+      decorationManager.applyToAllVisibleEditors();
+    }
+  });
+  watcher.onDidDelete((uri) => {
+    const runId = path.basename(uri.fsPath, ".jsonl");
+    store.runTraces.delete(runId);
+    if (store.activeRunId === runId) {
+      store.activeRunId = null;
+      store.selectedCallId = null;
+      decorationManager.clearAll();
+    }
+    provider.refresh();
+    allTracesProvider.refresh();
+  });
+  context.subscriptions.push(watcher);
   vscode.window.onDidChangeActiveTextEditor((editor) => {
     if (editor && store.activeRunId) {
       decorationManager.applyToEditor(editor);
@@ -808,15 +930,43 @@ Your current changes will be stashed and restored when you click "Back to curren
     decorationManager.applyToAllVisibleEditors();
   }
   runEnvironmentChecks();
+  vscode.commands.executeCommand("workbench.view.extension.cdweave-sidebar");
+  const showCmd = vscode.commands.registerCommand("cdweave.show", () => {
+    vscode.commands.executeCommand("workbench.view.extension.cdweave-sidebar");
+  });
+  const selectProjectCmd = vscode.commands.registerCommand("cdweave.selectProject", async () => {
+    const projects = getProjects();
+    if (projects.length === 0) {
+      vscode.window.showInformationMessage("CodeWeave: No projects found in ~/.cache/codeweave/");
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      projects.map((p) => ({
+        label: p,
+        description: p === store.activeProject ? "(active)" : void 0
+      })),
+      { placeHolder: "Select a project to view runs" }
+    );
+    if (picked) {
+      provider.setProject(picked.label);
+      allTracesProvider.refresh();
+      context.globalState.update("activeProject", picked.label);
+    }
+  });
+  context.subscriptions.push(showCmd, selectProjectCmd);
   context.subscriptions.push(
     treeView,
     allTracesView,
     detailView,
     hoverDisposable,
+    unlockFilesCmd,
     clearFocusCmd,
     openTraceUrlCmd,
     restoreRunCodeCmd,
     restoreMainCodeCmd,
+    copyRunTracesCmd,
+    copyTraceCmd,
+    goToCallSiteCmd,
     selectTraceCmd,
     { dispose: () => decorationManager.dispose() }
   );
